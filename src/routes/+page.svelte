@@ -8,12 +8,53 @@
 
   const appWindow = getCurrentWebviewWindow();
 
-  let tasks = $state<Task[]>([]);
-  let settings = $state<Settings | null>(null);
+  let tasks       = $state<Task[]>([]);
+  let settings    = $state<Settings | null>(null);
   let newTaskText = $state('');
-  let loading = $state(true);
-  let error = $state<string | null>(null);
+  let loading     = $state(true);
+  let error       = $state<string | null>(null);
 
+  // ── Theme ──────────────────────────────────────────────────────────────────
+  type Theme = 'system' | 'light' | 'dark';
+  const themeOrder: Theme[] = ['system', 'light', 'dark'];
+
+  function applyTheme(theme: Theme) {
+    if (theme === 'system') {
+      document.documentElement.removeAttribute('data-theme');
+    } else {
+      document.documentElement.setAttribute('data-theme', theme);
+    }
+  }
+
+  async function cycleTheme() {
+    if (!settings) return;
+    const cur = (settings.theme ?? 'system') as Theme;
+    const next = themeOrder[(themeOrder.indexOf(cur) + 1) % themeOrder.length];
+    const updated = { ...settings, theme: next };
+    settings = updated;
+    applyTheme(next);
+    await invoke('save_settings', { settings: updated });
+  }
+
+  // ── Always-on-top ──────────────────────────────────────────────────────────
+  async function toggleAOT() {
+    if (!settings) return;
+    const newVal = !settings.always_on_top;
+    const updated = { ...settings, always_on_top: newVal };
+    settings = updated;
+    await appWindow.setAlwaysOnTop(newVal);
+    await invoke('save_settings', { settings: updated });
+  }
+
+  // ── Resize dragging ────────────────────────────────────────────────────────
+  type ResizeDir = 'North' | 'South' | 'East' | 'West' |
+                   'NorthEast' | 'NorthWest' | 'SouthEast' | 'SouthWest';
+
+  function onResizeMousedown(e: MouseEvent, dir: ResizeDir) {
+    if (e.buttons === 1) (appWindow as any).startResizeDragging(dir);
+  }
+
+  // ── Tasks ──────────────────────────────────────────────────────────────────
   async function loadTasks() {
     try {
       tasks = await invoke<Task[]>('read_tasks');
@@ -34,34 +75,28 @@
     (async () => {
       await loadSettings();
       if (settings?.vault_path) await loadTasks();
+      applyTheme((settings?.theme ?? 'system') as Theme);
       loading = false;
 
       unlistenFile = await listen('file-changed', () => loadTasks());
       unlistenSettings = await listen<Settings>('settings-changed', (e) => {
         settings = e.payload;
+        applyTheme((settings?.theme ?? 'system') as Theme);
         if (settings?.vault_path) loadTasks();
       });
     })();
 
-    return () => {
-      unlistenFile?.();
-      unlistenSettings?.();
-    };
+    return () => { unlistenFile?.(); unlistenSettings?.(); };
   });
 
   async function handleToggle(task: Task) {
-    // Optimistic update
-    const updated = tasks.map(t =>
-      t.id === task.id ? { ...t, done: !t.done } : t
-    );
+    const updated = tasks.map(t => t.id === task.id ? { ...t, done: !t.done } : t);
     tasks = updated;
     await invoke('write_tasks', { tasks: updated });
   }
 
   async function handleEdit(task: Task, text: string) {
-    const updated = tasks.map(t =>
-      t.id === task.id ? { ...t, text } : t
-    );
+    const updated = tasks.map(t => t.id === task.id ? { ...t, text } : t);
     tasks = updated;
     await invoke('write_tasks', { tasks: updated });
   }
@@ -79,10 +114,6 @@
     await loadTasks();
   }
 
-  function handleAddKeydown(e: KeyboardEvent) {
-    if (e.key === 'Enter') handleAddTask();
-  }
-
   async function pickVault() {
     const path = await invoke<string | null>('pick_vault_folder');
     if (path && settings) {
@@ -93,27 +124,81 @@
     }
   }
 
-  function onHeaderMousedown(e: MouseEvent) {
-    if (e.buttons === 1) appWindow.startDragging();
-  }
-
   let pendingTasks = $derived(tasks.filter(t => !t.done));
-  let doneTasks = $derived(tasks.filter(t => t.done));
+  let currentTheme = $derived((settings?.theme ?? 'system') as Theme);
 </script>
 
+<!-- Invisible resize handles on all 8 edges/corners -->
+<div class="rh rh-n"  onmousedown={(e) => onResizeMousedown(e, 'North')}     role="none"></div>
+<div class="rh rh-s"  onmousedown={(e) => onResizeMousedown(e, 'South')}     role="none"></div>
+<div class="rh rh-e"  onmousedown={(e) => onResizeMousedown(e, 'East')}      role="none"></div>
+<div class="rh rh-w"  onmousedown={(e) => onResizeMousedown(e, 'West')}      role="none"></div>
+<div class="rh rh-ne" onmousedown={(e) => onResizeMousedown(e, 'NorthEast')} role="none"></div>
+<div class="rh rh-nw" onmousedown={(e) => onResizeMousedown(e, 'NorthWest')} role="none"></div>
+<div class="rh rh-se" onmousedown={(e) => onResizeMousedown(e, 'SouthEast')} role="none"></div>
+<div class="rh rh-sw" onmousedown={(e) => onResizeMousedown(e, 'SouthWest')} role="none"></div>
+
 <div class="widget">
-  <!-- Header / drag handle -->
-  <div class="header" onmousedown={onHeaderMousedown} role="none">
-    <span class="header-title">
-      {#if settings?.target_file}
-        {settings.target_file.replace(/\.md$/i, '')}
-      {:else}
-        ob-widget
-      {/if}
+  <!-- Header — data-tauri-drag-region makes the whole row draggable;
+       buttons inside are automatically excluded from drag detection -->
+  <div class="header" data-tauri-drag-region role="none">
+    <span class="header-title" data-tauri-drag-region>
+      {settings?.target_file?.replace(/\.md$/i, '') ?? 'ob-widget'}
     </span>
-    {#if tasks.length > 0}
-      <span class="header-count">{pendingTasks.length}/{tasks.length}</span>
-    {/if}
+
+    <div class="header-right" data-tauri-drag-region>
+      {#if tasks.length > 0}
+        <span class="header-count" data-tauri-drag-region>
+          {pendingTasks.length}/{tasks.length}
+        </span>
+      {/if}
+
+      <!-- Theme toggle: cycles system → light → dark -->
+      <button
+        class="icon-btn"
+        onclick={cycleTheme}
+        title="Theme: {currentTheme}"
+        aria-label="Cycle theme ({currentTheme})"
+      >
+        {#if currentTheme === 'light'}
+          <!-- Sun -->
+          <svg viewBox="0 0 16 16" fill="currentColor">
+            <circle cx="8" cy="8" r="3"/>
+            <path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.22 3.22l1.42 1.42M11.36 11.36l1.42 1.42M3.22 12.78l1.42-1.42M11.36 4.64l1.42-1.42" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/>
+          </svg>
+        {:else if currentTheme === 'dark'}
+          <!-- Moon -->
+          <svg viewBox="0 0 16 16" fill="currentColor">
+            <path d="M6 2a6 6 0 1 0 8 8 4.5 4.5 0 0 1-8-8Z"/>
+          </svg>
+        {:else}
+          <!-- System (half circle) -->
+          <svg viewBox="0 0 16 16" fill="currentColor">
+            <path d="M8 2a6 6 0 1 0 0 12A6 6 0 0 0 8 2Zm0 1v10a5 5 0 0 1 0-10Z"/>
+          </svg>
+        {/if}
+      </button>
+
+      <!-- Always-on-top toggle -->
+      <button
+        class="icon-btn"
+        class:active={settings?.always_on_top}
+        onclick={toggleAOT}
+        title={settings?.always_on_top ? 'Always on top: on' : 'Always on top: off'}
+        aria-label="Toggle always on top"
+      >
+        <!-- Pin icon — filled when active -->
+        {#if settings?.always_on_top}
+          <svg viewBox="0 0 16 16" fill="currentColor">
+            <path d="M9.5 1h-3l-.5 4H4l1 2h2v4l1 3 1-3V7h2l1-2H10L9.5 1Z"/>
+          </svg>
+        {:else}
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+            <path d="M9.5 1h-3l-.5 4H4l1 2h2v4l1 3 1-3V7h2l1-2H10L9.5 1Z"/>
+          </svg>
+        {/if}
+      </button>
+    </div>
   </div>
 
   <!-- Body -->
@@ -140,15 +225,9 @@
     </div>
 
   {:else}
-    <TaskList
-      tasks={tasks}
-      ontoggle={handleToggle}
-      onedit={handleEdit}
-      ondelete={handleDelete}
-    />
+    <TaskList tasks={tasks} ontoggle={handleToggle} onedit={handleEdit} ondelete={handleDelete} />
   {/if}
 
-  <!-- Add task input (only when configured) -->
   {#if settings?.vault_path && !error}
     <div class="add-row">
       <input
@@ -156,65 +235,114 @@
         type="text"
         placeholder="New task…"
         bind:value={newTaskText}
-        onkeydown={handleAddKeydown}
+        onkeydown={(e) => e.key === 'Enter' && handleAddTask()}
       />
     </div>
   {/if}
 </div>
 
 <style>
+  /* ── Theme via color-scheme ──────────────────────────────────────────────── */
+  :global(:root)                     { color-scheme: light dark; }
+  :global(:root[data-theme="light"]) { color-scheme: light; }
+  :global(:root[data-theme="dark"])  { color-scheme: dark; }
+
+  /* ── Resize handles ──────────────────────────────────────────────────────── */
+  .rh { position: fixed; z-index: 9999; }
+  .rh-n  { top: 0;    left: 6px;  right: 6px;  height: 5px; cursor: n-resize; }
+  .rh-s  { bottom: 0; left: 6px;  right: 6px;  height: 5px; cursor: s-resize; }
+  .rh-e  { right: 0;  top: 6px;   bottom: 6px; width: 5px;  cursor: e-resize; }
+  .rh-w  { left: 0;   top: 6px;   bottom: 6px; width: 5px;  cursor: w-resize; }
+  .rh-ne { top: 0;    right: 0;   width: 8px;  height: 8px; cursor: ne-resize; }
+  .rh-nw { top: 0;    left: 0;    width: 8px;  height: 8px; cursor: nw-resize; }
+  .rh-se { bottom: 0; right: 0;   width: 8px;  height: 8px; cursor: se-resize; }
+  .rh-sw { bottom: 0; left: 0;    width: 8px;  height: 8px; cursor: sw-resize; }
+
+  /* ── Widget shell ────────────────────────────────────────────────────────── */
   .widget {
     display: flex;
     flex-direction: column;
     width: 100vw;
     height: 100vh;
     color: light-dark(#1a1a1a, #e8e8e8);
-    background: light-dark(rgba(242, 242, 247, 0.72), rgba(28, 28, 30, 0.72));
+    background: light-dark(rgba(242, 242, 247, 0.75), rgba(28, 28, 30, 0.75));
     border-radius: 10px;
     overflow: hidden;
   }
 
-  /* Fallback for browsers without light-dark() — Mica handles the real bg anyway */
-  @media (prefers-color-scheme: dark) {
-    .widget {
-      color: #e8e8e8;
-      background: rgba(28, 28, 30, 0.72);
-    }
-  }
-
-  @media (prefers-color-scheme: light) {
-    .widget {
-      color: #1a1a1a;
-      background: rgba(242, 242, 247, 0.72);
-    }
-  }
-
-  /* Header */
+  /* ── Header ──────────────────────────────────────────────────────────────── */
   .header {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    padding: 8px 12px 6px;
+    gap: 6px;
+    padding: 7px 8px 6px 12px;
     cursor: move;
     border-bottom: 1px solid rgba(128, 128, 128, 0.15);
     flex-shrink: 0;
   }
 
   .header-title {
-    font-size: 12px;
+    font-size: 11.5px;
     font-weight: 600;
-    opacity: 0.7;
-    letter-spacing: 0.02em;
+    opacity: 0.65;
+    letter-spacing: 0.04em;
     text-transform: uppercase;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: move;
+  }
+
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
+    cursor: move;
   }
 
   .header-count {
     font-size: 11px;
-    opacity: 0.45;
+    opacity: 0.4;
     font-variant-numeric: tabular-nums;
+    padding-right: 4px;
+    cursor: move;
   }
 
-  /* States */
+  /* ── Icon buttons (theme + AOT) ──────────────────────────────────────────── */
+  .icon-btn {
+    width: 22px;
+    height: 22px;
+    border-radius: 5px;
+    border: none;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    opacity: 0.45;
+    transition: opacity 0.12s, background 0.12s;
+    flex-shrink: 0;
+  }
+
+  .icon-btn svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  .icon-btn:hover {
+    opacity: 0.9;
+    background: rgba(128, 128, 128, 0.15);
+  }
+
+  .icon-btn.active {
+    opacity: 0.85;
+  }
+
+  /* ── States ──────────────────────────────────────────────────────────────── */
   .state-msg {
     flex: 1;
     display: flex;
@@ -228,18 +356,9 @@
     padding: 20px;
   }
 
-  .state-msg.error {
-    opacity: 0.8;
-    gap: 8px;
-  }
+  .state-msg.error { opacity: 0.8; gap: 8px; }
+  .state-msg.error code { font-size: 11px; opacity: 0.6; word-break: break-all; }
 
-  .state-msg.error code {
-    font-size: 11px;
-    opacity: 0.6;
-    word-break: break-all;
-  }
-
-  /* Setup screen */
   .setup {
     flex: 1;
     display: flex;
@@ -251,16 +370,9 @@
     text-align: center;
   }
 
-  .setup-title {
-    font-weight: 600;
-    font-size: 13px;
-  }
+  .setup-title { font-weight: 600; font-size: 13px; }
 
-  .setup-hint {
-    font-size: 11.5px;
-    opacity: 0.55;
-    line-height: 1.5;
-  }
+  .setup-hint { font-size: 11.5px; opacity: 0.55; line-height: 1.5; }
 
   .setup-btn {
     margin-top: 4px;
@@ -275,11 +387,9 @@
     transition: background 0.15s;
   }
 
-  .setup-btn:hover {
-    background: rgba(128, 128, 128, 0.22);
-  }
+  .setup-btn:hover { background: rgba(128, 128, 128, 0.22); }
 
-  /* Add-task row */
+  /* ── Add-task row ────────────────────────────────────────────────────────── */
   .add-row {
     flex-shrink: 0;
     padding: 6px 10px 8px;
@@ -300,9 +410,7 @@
     transition: border-color 0.15s;
   }
 
-  .add-input::placeholder {
-    opacity: 0.4;
-  }
+  .add-input::placeholder { opacity: 0.4; }
 
   .add-input:focus {
     border-color: rgba(128, 128, 128, 0.45);

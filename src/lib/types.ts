@@ -18,4 +18,5 @@ export interface Settings {
   window: WindowConfig;
   always_on_top: boolean;
   click_through_on_blur: boolean;
+  theme: 'system' | 'light' | 'dark';
 }
