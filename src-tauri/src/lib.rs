@@ -303,12 +303,37 @@ fn delete_task(state: State<'_, AppState>, line_idx: usize) -> Result<(), String
 }
 
 #[tauri::command]
-fn pick_vault_folder(app: AppHandle) -> Option<String> {
+fn pick_task_file(app: AppHandle) {
     use tauri_plugin_dialog::DialogExt;
+    let app_cb = app.clone();
     app.dialog()
         .file()
-        .blocking_pick_folder()
-        .map(|fp| fp.to_string())
+        .add_filter("Markdown", &["md", "MD"])
+        .pick_file(move |file_path| {
+            let Some(fp) = file_path else { return };
+            let path_str = fp.to_string();
+            let path = std::path::Path::new(&path_str);
+            let vault_path = path.parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let target_file = path.file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Tasks.md".to_string());
+            let state = app_cb.state::<AppState>();
+            let task_file = {
+                let mut s = state.settings.lock().unwrap();
+                s.vault_path = vault_path;
+                s.target_file = target_file;
+                target_file_path(&s)
+            };
+            let settings = state.settings.lock().unwrap().clone();
+            persist_settings(&app_cb, &settings);
+            if let Some(task_path) = task_file {
+                let mut wg = state.watcher.lock().unwrap();
+                start_watcher(&app_cb, task_path, Arc::clone(&state.ignore_change), &mut wg);
+            }
+            app_cb.emit("settings-changed", settings).ok();
+        });
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────────
@@ -399,7 +424,7 @@ pub fn run() {
             use tauri_plugin_autostart::ManagerExt;
             let launch_at_login = app.autolaunch().is_enabled().unwrap_or(false);
 
-            let change_file = MenuItem::with_id(app, "change_file", "Change Target File…", true, None::<&str>)?;
+            let change_file = MenuItem::with_id(app, "change_file", "Choose Note File…", true, None::<&str>)?;
             let always_top = CheckMenuItem::with_id(app, "always_top", "Always on Top", true, aot, None::<&str>)?;
             let click_through = CheckMenuItem::with_id(app, "click_through", "Click-through", true, click_thru, None::<&str>)?;
             let launch_login = CheckMenuItem::with_id(app, "launch_login", "Launch at Login", true, launch_at_login, None::<&str>)?;
@@ -415,27 +440,36 @@ pub fn run() {
                     let state = app.state::<AppState>();
                     match event.id().as_ref() {
                         "change_file" => {
-                            let app_clone = app.clone();
-                            std::thread::spawn(move || {
-                                use tauri_plugin_dialog::DialogExt;
-                                let folder = app_clone.dialog().file().blocking_pick_folder();
-                                if let Some(fp) = folder {
+                            use tauri_plugin_dialog::DialogExt;
+                            let app_cb = app.clone();
+                            app.clone().dialog()
+                                .file()
+                                .add_filter("Markdown", &["md", "MD"])
+                                .pick_file(move |file_path| {
+                                    let Some(fp) = file_path else { return };
                                     let path_str = fp.to_string();
-                                    let state = app_clone.state::<AppState>();
-                                    let file_path = {
+                                    let path = std::path::Path::new(&path_str);
+                                    let vault_path = path.parent()
+                                        .map(|p| p.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    let target_file = path.file_name()
+                                        .map(|f| f.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "Tasks.md".to_string());
+                                    let state = app_cb.state::<AppState>();
+                                    let task_file = {
                                         let mut s = state.settings.lock().unwrap();
-                                        s.vault_path = path_str;
+                                        s.vault_path = vault_path;
+                                        s.target_file = target_file;
                                         target_file_path(&s)
                                     };
                                     let settings = state.settings.lock().unwrap().clone();
-                                    persist_settings(&app_clone, &settings);
-                                    if let Some(fp) = file_path {
+                                    persist_settings(&app_cb, &settings);
+                                    if let Some(task_path) = task_file {
                                         let mut wg = state.watcher.lock().unwrap();
-                                        start_watcher(&app_clone, fp, Arc::clone(&state.ignore_change), &mut wg);
+                                        start_watcher(&app_cb, task_path, Arc::clone(&state.ignore_change), &mut wg);
                                     }
-                                    app_clone.emit("settings-changed", settings).ok();
-                                }
-                            });
+                                    app_cb.emit("settings-changed", settings).ok();
+                                });
                         }
                         "always_top" => {
                             let new_val = {
@@ -546,7 +580,7 @@ pub fn run() {
             write_tasks,
             add_task,
             delete_task,
-            pick_vault_folder,
+            pick_task_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

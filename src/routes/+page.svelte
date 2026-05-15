@@ -115,13 +115,7 @@
   }
 
   async function pickVault() {
-    const path = await invoke<string | null>('pick_vault_folder');
-    if (path && settings) {
-      const updated = { ...settings, vault_path: path };
-      await invoke('save_settings', { settings: updated });
-      settings = updated;
-      await loadTasks();
-    }
+    await invoke('pick_task_file');
   }
 
   let pendingTasks = $derived(tasks.filter(t => !t.done));
@@ -207,16 +201,16 @@
 
   {:else if !settings?.vault_path}
     <div class="setup">
-      <p class="setup-title">No vault configured</p>
-      <p class="setup-hint">Point the widget to your Obsidian vault folder.</p>
-      <button class="setup-btn" onclick={pickVault}>Choose Vault Folder</button>
+      <p class="setup-title">No note file selected</p>
+      <p class="setup-hint">Choose an Obsidian note (.md file) to use as your task list.</p>
+      <button class="setup-btn" onclick={pickVault}>Choose Note File</button>
     </div>
 
   {:else if error}
     <div class="state-msg error">
       <p>Could not read file:</p>
       <code>{error}</code>
-      <button class="setup-btn" onclick={pickVault} style="margin-top:12px">Change Vault</button>
+      <button class="setup-btn" onclick={pickVault} style="margin-top:12px">Choose Note File</button>
     </div>
 
   {:else if tasks.length === 0}
