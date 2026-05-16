@@ -3,16 +3,41 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
-  import TaskList from '$lib/TaskList.svelte';
-  import type { Task, Settings } from '$lib/types';
+  import NoteView from '$lib/NoteView.svelte';
+  import type { Task, NoteItem, Settings } from '$lib/types';
 
   const appWindow = getCurrentWebviewWindow();
 
-  let tasks       = $state<Task[]>([]);
+  let noteItems   = $state<NoteItem[]>([]);
   let settings    = $state<Settings | null>(null);
   let newTaskText = $state('');
   let loading     = $state(true);
   let error       = $state<string | null>(null);
+
+  // ── Transparency popover ────────────────────────────────────────────────────
+  let showOpacitySlider = $state(false);
+  let opacity = $state(1.0);
+
+  async function handleOpacityChange(val: number) {
+    opacity = val;
+    // Control the background alpha via CSS custom property
+    document.documentElement.style.setProperty('--bg-alpha', String(opacity));
+    await invoke('set_opacity', { opacity });
+  }
+
+  function toggleOpacitySlider() {
+    showOpacitySlider = !showOpacitySlider;
+  }
+
+  // Close popover when clicking outside
+  function handleGlobalClick(e: MouseEvent) {
+    const target = e.target as HTMLElement;
+    if (showOpacitySlider && !target.closest('.opacity-wrap')) showOpacitySlider = false;
+    if (showShortcutPopover && !target.closest('.shortcut-wrap')) {
+      showShortcutPopover = false;
+      recordingShortcut = false;
+    }
+  }
 
   // ── Theme ──────────────────────────────────────────────────────────────────
   type Theme = 'system' | 'light' | 'dark';
@@ -46,6 +71,22 @@
     await invoke('save_settings', { settings: updated });
   }
 
+  // ── Bring to top once (Ctrl+Shift+Space) ───────────────────────────────────
+  async function bringToTopOnce() {
+    await appWindow.setAlwaysOnTop(true);
+    await appWindow.setFocus();
+    // Restore the real AOT setting when the window next loses focus
+    // The Rust side handles that via hotkey_aot_override.
+    // From JS we mirror the same: if AOT was off, schedule restore on blur.
+    if (settings && !settings.always_on_top) {
+      const restore = async () => {
+        await appWindow.setAlwaysOnTop(false);
+        window.removeEventListener('blur', restore);
+      };
+      window.addEventListener('blur', restore, { once: true });
+    }
+  }
+
   // ── Resize dragging ────────────────────────────────────────────────────────
   type ResizeDir = 'North' | 'South' | 'East' | 'West' |
                    'NorthEast' | 'NorthWest' | 'SouthEast' | 'SouthWest';
@@ -54,10 +95,10 @@
     if (e.buttons === 1) (appWindow as any).startResizeDragging(dir);
   }
 
-  // ── Tasks ──────────────────────────────────────────────────────────────────
-  async function loadTasks() {
+  // ── Note / Tasks ───────────────────────────────────────────────────────────
+  async function loadNote() {
     try {
-      tasks = await invoke<Task[]>('read_tasks');
+      noteItems = await invoke<NoteItem[]>('read_note');
       error = null;
     } catch (e) {
       error = String(e);
@@ -66,6 +107,8 @@
 
   async function loadSettings() {
     settings = await invoke<Settings>('get_settings');
+    opacity = settings?.opacity ?? 1.0;
+    document.documentElement.style.setProperty('--bg-alpha', String(opacity));
   }
 
   onMount(() => {
@@ -74,36 +117,50 @@
 
     (async () => {
       await loadSettings();
-      if (settings?.vault_path) await loadTasks();
+      if (settings?.vault_path) await loadNote();
       applyTheme((settings?.theme ?? 'system') as Theme);
       loading = false;
 
-      unlistenFile = await listen('file-changed', () => loadTasks());
+      unlistenFile = await listen('file-changed', () => loadNote());
       unlistenSettings = await listen<Settings>('settings-changed', (e) => {
         settings = e.payload;
         applyTheme((settings?.theme ?? 'system') as Theme);
-        if (settings?.vault_path) loadTasks();
+        if (settings?.vault_path) loadNote();
       });
     })();
 
     return () => { unlistenFile?.(); unlistenSettings?.(); };
   });
 
-  async function handleToggle(task: Task) {
-    const updated = tasks.map(t => t.id === task.id ? { ...t, done: !t.done } : t);
-    tasks = updated;
-    await invoke('write_tasks', { tasks: updated });
+  // ── Task operations ────────────────────────────────────────────────────────
+  // Build Task list from NoteItems for write_tasks
+  function buildTasksFromItems(items: NoteItem[]): Task[] {
+    return items
+      .filter(i => i.kind === 'task')
+      .map(i => ({ id: i.task_id, done: i.done, text: i.text, line_idx: i.line_idx }));
   }
 
-  async function handleEdit(task: Task, text: string) {
-    const updated = tasks.map(t => t.id === task.id ? { ...t, text } : t);
-    tasks = updated;
-    await invoke('write_tasks', { tasks: updated });
+  async function handleToggle(taskId: number, lineIdx: number) {
+    noteItems = noteItems.map(i =>
+      i.kind === 'task' && i.task_id === taskId
+        ? { ...i, done: !i.done }
+        : i
+    );
+    await invoke('write_tasks', { tasks: buildTasksFromItems(noteItems) });
   }
 
-  async function handleDelete(task: Task) {
-    tasks = tasks.filter(t => t.id !== task.id);
-    await invoke('delete_task', { lineIdx: task.line_idx });
+  async function handleEdit(taskId: number, lineIdx: number, text: string) {
+    noteItems = noteItems.map(i =>
+      i.kind === 'task' && i.task_id === taskId
+        ? { ...i, text }
+        : i
+    );
+    await invoke('write_tasks', { tasks: buildTasksFromItems(noteItems) });
+  }
+
+  async function handleDelete(lineIdx: number) {
+    noteItems = noteItems.filter(i => i.line_idx !== lineIdx);
+    await invoke('delete_task', { lineIdx });
   }
 
   async function handleAddTask() {
@@ -111,16 +168,62 @@
     if (!text) return;
     newTaskText = '';
     await invoke('add_task', { text });
-    await loadTasks();
+    await loadNote();
   }
 
   async function pickVault() {
     await invoke('pick_task_file');
   }
 
-  let pendingTasks = $derived(tasks.filter(t => !t.done));
+  let taskItems    = $derived(noteItems.filter(i => i.kind === 'task'));
+  let pendingTasks = $derived(taskItems.filter(i => !i.done));
   let currentTheme = $derived((settings?.theme ?? 'system') as Theme);
+  let hasContent   = $derived(noteItems.length > 0);
+
+  // ── Shortcut popover ────────────────────────────────────────────────────────
+  let showShortcutPopover = $state(false);
+  let recordingShortcut   = $state(false);
+  let shortcutError       = $state('');
+
+  function currentShortcutDisplay() {
+    return settings?.shortcut ?? 'CmdOrControl+Shift+O';
+  }
+
+  function keyToAccelerator(e: KeyboardEvent): string | null {
+    const mods: string[] = [];
+    if (e.ctrlKey)  mods.push('Ctrl');
+    if (e.shiftKey) mods.push('Shift');
+    if (e.altKey)   mods.push('Alt');
+    const key = e.key;
+    if (['Control','Shift','Alt','Meta'].includes(key)) return null;
+    const map: Record<string, string> = {
+      ' ': 'Space', 'ArrowUp': 'Up', 'ArrowDown': 'Down',
+      'ArrowLeft': 'Left', 'ArrowRight': 'Right',
+      'Enter': 'Return', 'Backspace': 'Backspace',
+      'Delete': 'Delete', 'Escape': 'Escape', 'Tab': 'Tab',
+    };
+    const k = map[key] ?? (key.length === 1 ? key.toUpperCase() : key);
+    mods.push(k);
+    return mods.join('+');
+  }
+
+  async function handleShortcutKeydown(e: KeyboardEvent) {
+    if (!recordingShortcut) return;
+    e.preventDefault(); e.stopPropagation();
+    const acc = keyToAccelerator(e);
+    if (!acc) return;
+    recordingShortcut = false;
+    shortcutError = '';
+    try {
+      await invoke('update_shortcut', { shortcut: acc });
+      if (settings) settings = { ...settings, shortcut: acc };
+    } catch (err) {
+      shortcutError = String(err);
+    }
+  }
 </script>
+
+<svelte:window onclick={handleGlobalClick} onkeydown={handleShortcutKeydown} />
 
 <!-- Invisible resize handles on all 8 edges/corners -->
 <div class="rh rh-n"  onmousedown={(e) => onResizeMousedown(e, 'North')}     role="none"></div>
@@ -141,11 +244,45 @@
     </span>
 
     <div class="header-right" data-tauri-drag-region>
-      {#if tasks.length > 0}
+      {#if taskItems.length > 0}
         <span class="header-count" data-tauri-drag-region>
-          {pendingTasks.length}/{tasks.length}
+          {pendingTasks.length}/{taskItems.length}
         </span>
       {/if}
+
+      <!-- Opacity control -->
+      <div class="opacity-wrap" data-tauri-drag-region>
+        <button
+          class="icon-btn"
+          id="opacity-btn"
+          onclick={(e) => { e.stopPropagation(); toggleOpacitySlider(); }}
+          title="Adjust transparency"
+          aria-label="Adjust transparency"
+          data-tauri-drag-region="false"
+        >
+          <!-- Layers / opacity icon -->
+          <svg viewBox="0 0 16 16" fill="currentColor">
+            <circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" stroke-width="1.4" opacity="0.9"/>
+            <path d="M8 2.5A5.5 5.5 0 0 1 8 13.5Z" fill="currentColor"/>
+          </svg>
+        </button>
+
+        {#if showOpacitySlider}
+          <div class="opacity-popover" role="none" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+            <span class="opacity-label">{Math.round(opacity * 100)}%</span>
+            <input
+              id="opacity-slider"
+              class="opacity-slider"
+              type="range"
+              min="0.15"
+              max="1"
+              step="0.05"
+              value={opacity}
+              oninput={(e) => handleOpacityChange(parseFloat((e.target as HTMLInputElement).value))}
+            />
+          </div>
+        {/if}
+      </div>
 
       <!-- Theme toggle: cycles system → light → dark -->
       <button
@@ -192,6 +329,41 @@
           </svg>
         {/if}
       </button>
+
+      <!-- Bring-to-top-once + shortcut config -->
+      <div class="shortcut-wrap" data-tauri-drag-region>
+        <button
+          class="icon-btn"
+          onclick={(e) => { e.stopPropagation(); bringToTopOnce(); }}
+          oncontextmenu={(e) => { e.preventDefault(); e.stopPropagation(); showShortcutPopover = !showShortcutPopover; recordingShortcut = false; }}
+          title="Bring to top once ({currentShortcutDisplay()}) — right-click to change shortcut"
+          aria-label="Bring to top once"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor">
+            <path d="M8 2 L14 8 H10 V14 H6 V8 H2 Z"/>
+          </svg>
+        </button>
+
+        {#if showShortcutPopover}
+          <div class="shortcut-popover" role="none"
+            onclick={(e) => e.stopPropagation()}
+            onkeydown={(e) => { e.stopPropagation(); handleShortcutKeydown(e); }}
+          >
+            <p class="shortcut-title">Bring-to-top shortcut</p>
+            <button
+              class="shortcut-recorder"
+              class:recording={recordingShortcut}
+              onclick={(e) => { e.stopPropagation(); recordingShortcut = true; shortcutError = ''; }}
+            >
+              {recordingShortcut ? 'Press keys…' : currentShortcutDisplay()}
+            </button>
+            {#if shortcutError}
+              <p class="shortcut-error">{shortcutError}</p>
+            {/if}
+            <p class="shortcut-hint">Click above, then press your key combo</p>
+          </div>
+        {/if}
+      </div>
     </div>
   </div>
 
@@ -213,13 +385,18 @@
       <button class="setup-btn" onclick={pickVault} style="margin-top:12px">Choose Note File</button>
     </div>
 
-  {:else if tasks.length === 0}
+  {:else if !hasContent}
     <div class="state-msg">
-      No tasks in <em>{settings.target_file}</em>
+      No content in <em>{settings.target_file}</em>
     </div>
 
   {:else}
-    <TaskList tasks={tasks} ontoggle={handleToggle} onedit={handleEdit} ondelete={handleDelete} />
+    <NoteView
+      items={noteItems}
+      ontoggle={handleToggle}
+      onedit={handleEdit}
+      ondelete={handleDelete}
+    />
   {/if}
 
   {#if settings?.vault_path && !error}
@@ -259,7 +436,10 @@
     width: 100vw;
     height: 100vh;
     color: light-dark(#1a1a1a, #e8e8e8);
-    background: light-dark(rgba(242, 242, 247, 0.75), rgba(28, 28, 30, 0.75));
+    background: light-dark(
+      rgb(255 255 255 / var(--bg-alpha, 0.85)),
+      rgb(28 28 30 / var(--bg-alpha, 0.75))
+    );
     border-radius: 10px;
     overflow: hidden;
   }
@@ -294,6 +474,7 @@
     gap: 2px;
     flex-shrink: 0;
     cursor: move;
+    position: relative;
   }
 
   .header-count {
@@ -304,7 +485,7 @@
     cursor: move;
   }
 
-  /* ── Icon buttons (theme + AOT) ──────────────────────────────────────────── */
+  /* ── Icon buttons ─────────────────────────────────────────────────────────── */
   .icon-btn {
     width: 22px;
     height: 22px;
@@ -334,6 +515,61 @@
 
   .icon-btn.active {
     opacity: 0.85;
+  }
+
+  /* ── Opacity popover ──────────────────────────────────────────────────────── */
+  .opacity-wrap {
+    position: relative;
+  }
+
+  .opacity-popover {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    background: light-dark(rgba(255, 255, 255, 0.97), rgba(38, 38, 42, 0.97));
+    border: 1px solid rgba(128, 128, 128, 0.2);
+    border-radius: 8px;
+    padding: 8px 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    z-index: 1000;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.18);
+    white-space: nowrap;
+    min-width: 160px;
+  }
+
+  .opacity-label {
+    font-size: 11px;
+    opacity: 0.65;
+    font-variant-numeric: tabular-nums;
+    min-width: 30px;
+    text-align: right;
+  }
+
+  .opacity-slider {
+    flex: 1;
+    -webkit-appearance: none;
+    appearance: none;
+    height: 4px;
+    border-radius: 2px;
+    background: rgba(128,128,128,0.3);
+    outline: none;
+    cursor: pointer;
+  }
+
+  .opacity-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 13px;
+    height: 13px;
+    border-radius: 50%;
+    background: light-dark(#555, #ccc);
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+
+  .opacity-slider::-webkit-slider-thumb:hover {
+    background: light-dark(#222, #fff);
   }
 
   /* ── States ──────────────────────────────────────────────────────────────── */
@@ -409,5 +645,67 @@
   .add-input:focus {
     border-color: rgba(128, 128, 128, 0.45);
     background: rgba(128, 128, 128, 0.14);
+  }
+
+  /* ── Shortcut popover ─────────────────────────────────────────────────────── */
+  .shortcut-wrap { position: relative; }
+
+  .shortcut-popover {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    background: light-dark(rgba(255,255,255,0.97), rgba(38,38,42,0.97));
+    border: 1px solid rgba(128,128,128,0.2);
+    border-radius: 8px;
+    padding: 10px 12px;
+    z-index: 1000;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.18);
+    min-width: 180px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .shortcut-title {
+    font-size: 10.5px;
+    font-weight: 600;
+    opacity: 0.55;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    margin: 0;
+  }
+
+  .shortcut-recorder {
+    font-family: monospace;
+    font-size: 12px;
+    padding: 5px 10px;
+    border-radius: 5px;
+    border: 1px solid rgba(128,128,128,0.3);
+    background: rgba(128,128,128,0.1);
+    color: inherit;
+    cursor: pointer;
+    text-align: center;
+    transition: border-color 0.12s, background 0.12s;
+  }
+  .shortcut-recorder.recording {
+    border-color: rgba(100,150,255,0.6);
+    background: rgba(100,150,255,0.08);
+    animation: pulse 0.8s infinite alternate;
+  }
+  @keyframes pulse {
+    from { opacity: 0.7; } to { opacity: 1; }
+  }
+
+  .shortcut-hint {
+    font-size: 10px;
+    opacity: 0.4;
+    margin: 0;
+    line-height: 1.4;
+  }
+
+  .shortcut-error {
+    font-size: 10.5px;
+    color: #e05050;
+    margin: 0;
   }
 </style>

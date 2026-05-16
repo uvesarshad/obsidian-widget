@@ -19,4 +19,16 @@ export interface Settings {
   always_on_top: boolean;
   click_through_on_blur: boolean;
   theme: 'system' | 'light' | 'dark';
+  opacity: number;
+  shortcut: string;
+}
+
+export interface NoteItem {
+  line_idx: number;
+  kind: 'task' | 'heading' | 'separator' | 'text' | 'bullet';
+  text: string;
+  done: boolean;
+  task_id: number;
+  level: number;
+  indent: number;
 }
