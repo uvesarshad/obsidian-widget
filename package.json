@@ -1,6 +1,6 @@
 {
   "name": "ob-widget",
-  "version": "0.1.1",
+  "version": "0.2.1",
   "description": "Obsidian Live Widget — a persistent, interactive desktop widget for your Obsidian tasks.",
   "type": "module",
   "author": {

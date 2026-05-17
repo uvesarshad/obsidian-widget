@@ -1,17 +1,4 @@
-Use the standard Contributor Covenant v2.1 — it's the de-facto template for OSS. Copy verbatim from the official source:
-  https://www.contributor-covenant.org/version/2/1/code_of_conduct/code_of_conduct.md
-
-  Two lines you must edit at the bottom:
-  - Contact email — replace [INSERT CONTACT METHOD] with: uveskhan234@gmail.com
-  - Project name in the header
-
-  If you want the short version, the file should contain four sections: Our Pledge, Our Standards (acceptable +
-  unacceptable behaviour), Enforcement Responsibilities, and Enforcement (with your email).
-
-  ---
-  SECURITY.md
-
-  # Security Policy
+# Security Policy
 
   ## Supported Versions
 
@@ -155,14 +142,3 @@ Use the standard Contributor Covenant v2.1 — it's the de-facto template for OS
   - [ ] No /docs file exceeds 200 lines after my changes
   - [ ] Snake_case preserved on shared Settings/Task/Reminder types
   - [ ] Commit messages follow Conventional Commits
-
-  ---
-  Optional but recommended
-
-  FUNDING.yml at .github/FUNDING.yml — only if you want a "Sponsor" button on the repo. Leave empty otherwise. Example:    
-  github: [uvesarshad]
-
-  .gitattributes at repo root — normalise line endings:
-  * text=auto eol=lf
-  *.bat text eol=crlf
-  *.cmd text eol=crlf
