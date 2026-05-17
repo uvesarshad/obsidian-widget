@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or general discussion
+    url: https://github.com/uvesarshad/ob-widget/discussions
+    about: For open-ended questions, ideas, or "how do I…" — use GitHub Discussions instead of an issue.
+  - name: Security vulnerability
+    url: https://github.com/uvesarshad/ob-widget/blob/main/SECURITY.md
+    about: Do NOT file a public issue. Read SECURITY.md for the private reporting channel.

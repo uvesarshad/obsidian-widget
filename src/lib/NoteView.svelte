@@ -13,6 +13,33 @@
   let editingLineIdx = $state<number | null>(null);
   let editText       = $state('');
 
+  // ── Reminder tag parsing ──────────────────────────────────────────────────
+  // Matches "(@YYYY-MM-DD HH:MM)" and is tolerant of the legacy "@YYYY-MM-DDTHH:MM" form.
+  const REMINDER_RE = /\(@(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})\)|@(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/;
+
+  function extractReminder(text: string): { clean: string; date: Date | null } {
+    const m = text.match(REMINDER_RE);
+    if (!m) return { clean: text, date: null };
+    // Either the parenthesised group (1–5) or the legacy group (6–10) matched
+    const y  = +(m[1] ?? m[6]);
+    const mo = +(m[2] ?? m[7]) - 1;
+    const da = +(m[3] ?? m[8]);
+    const h  = +(m[4] ?? m[9]);
+    const mi = +(m[5] ?? m[10]);
+    const d  = new Date(y, mo, da, h, mi);
+    const clean = text.replace(REMINDER_RE, '').replace(/\s+/g, ' ').trim();
+    return { clean, date: isNaN(d.getTime()) ? null : d };
+  }
+
+  function fmtChip(d: Date): string {
+    const days   = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const h = d.getHours(), m = d.getMinutes();
+    const ampm = h < 12 ? 'AM' : 'PM';
+    const h12  = h === 0 ? 12 : h > 12 ? h - 12 : h;
+    return `${days[d.getDay()]} ${months[d.getMonth()]} ${d.getDate()}, ${h12}:${String(m).padStart(2,'0')} ${ampm}`;
+  }
+
   // ── Inline markdown → HTML (bold, italic, code, strikethrough) ──────────────
   function md(text: string): string {
     return text
@@ -113,12 +140,16 @@
             autofocus
           />
         {:else}
+          {@const rem = extractReminder(item.text)}
           <span
             class="task-text"
             ondblclick={() => startEdit(item)}
             role="none"
             title="Double-click to edit"
-          >{@html md(item.text)}</span>
+          >{@html md(rem.clean)}</span>
+          {#if rem.date && !item.done}
+            <span class="task-reminder" title={fmtChip(rem.date)}>⏰ {fmtChip(rem.date)}</span>
+          {/if}
         {/if}
 
         <button class="delete-btn" onclick={() => ondelete(item.line_idx)} aria-label="Delete task" tabindex="-1">×</button>
@@ -230,6 +261,18 @@
     flex: 1; font-size: 12.5px; font-family: inherit;
     background: rgba(128,128,128,0.1); border: none; border-radius: 3px;
     color: inherit; outline: none; padding: 1px 4px; user-select: text;
+  }
+
+  .task-reminder {
+    flex-shrink: 0;
+    font-size: 9px;
+    white-space: nowrap;
+    opacity: 0.55;
+    color: light-dark(#005fcc, #4aabff);
+    background: light-dark(rgba(0, 100, 220, 0.08), rgba(70, 160, 255, 0.12));
+    padding: 1px 5px;
+    border-radius: 3px;
+    cursor: default;
   }
 
   .delete-btn {

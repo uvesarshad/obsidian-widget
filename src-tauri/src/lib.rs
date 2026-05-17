@@ -1,7 +1,16 @@
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Max number of `fired: true` reminders kept on disk. Anything older is pruned
+/// on the next save to prevent reminders.json from growing without bound.
+const MAX_FIRED_REMINDERS: usize = 20;
+/// Known tone identifiers — validated when settings load so a corrupted or stale
+/// value can't break playback.
+const KNOWN_TONES: &[&str] = &["chime", "bell", "beep", "digital", "soft", "custom"];
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -27,6 +36,8 @@ impl Default for WindowConfig {
 fn default_theme() -> String { "system".to_string() }
 fn default_opacity() -> f64 { 1.0 }
 fn default_shortcut() -> String { "CmdOrControl+Shift+O".to_string() }
+fn default_reminder_tone() -> String { "chime".to_string() }
+fn default_reminder_tone_path() -> String { String::new() }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Settings {
@@ -37,12 +48,14 @@ pub struct Settings {
     pub click_through_on_blur: bool,
     #[serde(default = "default_theme")]
     pub theme: String,
-    /// Window opacity 0.0–1.0 (default 1.0)
     #[serde(default = "default_opacity")]
     pub opacity: f64,
-    /// Global shortcut to bring widget to front
     #[serde(default = "default_shortcut")]
     pub shortcut: String,
+    #[serde(default = "default_reminder_tone")]
+    pub reminder_tone: String,
+    #[serde(default = "default_reminder_tone_path")]
+    pub reminder_tone_path: String,
 }
 
 impl Default for Settings {
@@ -56,26 +69,20 @@ impl Default for Settings {
             theme: "system".to_string(),
             opacity: 1.0,
             shortcut: "CmdOrControl+Shift+O".to_string(),
+            reminder_tone: "chime".to_string(),
+            reminder_tone_path: String::new(),
         }
     }
 }
 
-/// A single rendered item from the note file.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct NoteItem {
-    /// 0-indexed line number in the source file
     pub line_idx: usize,
-    /// "task", "heading", "separator", "text"
     pub kind: String,
-    /// Raw display text (for tasks: just the task content, not the `- [ ]` prefix)
     pub text: String,
-    /// Only meaningful when kind == "task"
     pub done: bool,
-    /// Only meaningful when kind == "task"
     pub task_id: usize,
-    /// Heading level (1–6), only set when kind == "heading"
     pub level: u8,
-    /// Indentation depth (number of leading spaces / 2), for sub-tasks
     pub indent: usize,
 }
 
@@ -87,13 +94,21 @@ pub struct Task {
     pub line_idx: usize,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Reminder {
+    pub id: String,
+    pub task_text: String,
+    /// ISO 8601 local time: "2026-05-17T14:30"
+    pub remind_at: String,
+    pub fired: bool,
+}
+
 pub struct AppState {
     pub settings: Mutex<Settings>,
     pub watcher: Mutex<Option<RecommendedWatcher>>,
     pub ignore_change: Arc<Mutex<bool>>,
-    /// Set to true when the hotkey temporarily overrides always-on-top.
-    /// Cleared and restored when the window next loses focus.
     pub hotkey_aot_override: Arc<Mutex<bool>>,
+    pub reminders: Mutex<Vec<Reminder>>,
 }
 
 // ── Settings helpers ───────────────────────────────────────────────────────────
@@ -109,10 +124,16 @@ fn settings_path(app: &AppHandle) -> PathBuf {
 
 fn load_settings(app: &AppHandle) -> Settings {
     let path = settings_path(app);
-    std::fs::read_to_string(&path)
+    let mut settings: Settings = std::fs::read_to_string(&path)
         .ok()
         .and_then(|c| serde_json::from_str(&c).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Normalise reminder_tone — fall back to the default if the persisted value
+    // is unknown (corrupt file, manual edit, or a future-version remnant).
+    if !KNOWN_TONES.contains(&settings.reminder_tone.as_str()) {
+        settings.reminder_tone = default_reminder_tone();
+    }
+    settings
 }
 
 fn persist_settings(app: &AppHandle, settings: &Settings) {
@@ -122,15 +143,11 @@ fn persist_settings(app: &AppHandle, settings: &Settings) {
     }
 }
 
-/// Resolves the target file path, guarding against path traversal.
-/// `target_file` may contain subdirectory components (e.g. `Daily/Tasks.md`)
-/// but must not escape the vault via `..`.
 fn target_file_path(settings: &Settings) -> Option<PathBuf> {
     if settings.vault_path.is_empty() {
         return None;
     }
     let target = std::path::Path::new(&settings.target_file);
-    // Reject any path that contains a parent-directory (`..`) component.
     let has_traversal = target
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir));
@@ -138,6 +155,140 @@ fn target_file_path(settings: &Settings) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(&settings.vault_path).join(target))
+}
+
+// ── Reminder helpers ───────────────────────────────────────────────────────────
+
+fn reminders_path(app: &AppHandle) -> PathBuf {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir().join("ob-widget"));
+    std::fs::create_dir_all(&dir).ok();
+    dir.join("reminders.json")
+}
+
+fn load_reminders(app: &AppHandle) -> Vec<Reminder> {
+    let path = reminders_path(app);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default()
+}
+
+fn save_reminders(app: &AppHandle, reminders: &[Reminder]) {
+    let path = reminders_path(app);
+    if let Ok(json) = serde_json::to_string_pretty(reminders) {
+        std::fs::write(path, json).ok();
+    }
+}
+
+/// Process-local monotonic counter. Combined with a nanosecond timestamp this
+/// guarantees uniqueness across reminders created in the same nanosecond.
+static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn generate_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let counter = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}-{:x}", nanos, counter)
+}
+
+/// Drop the oldest `fired: true` reminders so the list stays bounded. Keeps all
+/// pending (`fired: false`) reminders untouched.
+fn prune_fired_reminders(reminders: &mut Vec<Reminder>) {
+    let fired_count = reminders.iter().filter(|r| r.fired).count();
+    if fired_count <= MAX_FIRED_REMINDERS {
+        return;
+    }
+    let drop_n = fired_count - MAX_FIRED_REMINDERS;
+    let mut dropped = 0usize;
+    reminders.retain(|r| {
+        if !r.fired { return true; }
+        if dropped < drop_n { dropped += 1; return false; }
+        true
+    });
+}
+
+fn parse_remind_at(s: &str) -> Option<DateTime<Local>> {
+    // Try the new "YYYY-MM-DD HH:MM" format first, then fall back to ISO variants
+    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M")
+        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M"))
+        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
+        .ok()
+        .and_then(|naive| Local.from_local_datetime(&naive).single())
+}
+
+fn check_and_fire_reminders(app: &AppHandle) {
+    use tauri_plugin_notification::NotificationExt;
+
+    let state = app.state::<AppState>();
+    let now = Local::now();
+
+    let due: Vec<(String, String)> = {
+        let reminders = state.reminders.lock().unwrap();
+        reminders
+            .iter()
+            .filter(|r| !r.fired)
+            .filter_map(|r| {
+                parse_remind_at(&r.remind_at)
+                    .filter(|t| now >= *t)
+                    .map(|_| (r.id.clone(), r.task_text.clone()))
+            })
+            .collect()
+    };
+
+    if due.is_empty() {
+        return;
+    }
+
+    // Bring widget to front (always-on-top, show, focus)
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_always_on_top(true);
+        let _ = window.set_focus();
+    }
+
+    for (id, text) in &due {
+        eprintln!("[reminder] firing {} — {}", id, text);
+
+        // OS toast (best-effort: may silently fail in dev without AUMID)
+        app.notification()
+            .builder()
+            .title("Reminder")
+            .body(text)
+            .show()
+            .ok();
+
+        // Notify the frontend so it can pulse + play sound
+        app.emit("reminder-fired", text.clone()).ok();
+    }
+
+    let fired_ids: std::collections::HashSet<String> =
+        due.into_iter().map(|(id, _)| id).collect();
+    let mut reminders = state.reminders.lock().unwrap();
+    for r in reminders.iter_mut() {
+        if fired_ids.contains(&r.id) {
+            r.fired = true;
+        }
+    }
+    prune_fired_reminders(&mut reminders);
+    save_reminders(app, &reminders);
+}
+
+fn start_reminder_scheduler(app: AppHandle) {
+    std::thread::spawn(move || {
+        // Fire any reminders that were due while the app was closed
+        check_and_fire_reminders(&app);
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            check_and_fire_reminders(&app);
+        }
+    });
 }
 
 // ── Markdown helpers ──────────────────────────────────────────────────────────
@@ -162,7 +313,6 @@ fn parse_tasks(content: &str) -> Vec<Task> {
         .collect()
 }
 
-/// Parse every line of the note into a typed NoteItem for rich display.
 fn parse_note_lines(content: &str) -> Vec<NoteItem> {
     let mut task_id = 0usize;
     content
@@ -173,7 +323,6 @@ fn parse_note_lines(content: &str) -> Vec<NoteItem> {
             let indent = indent_chars / 2;
             let t = line.trim_start();
 
-            // Task line
             if t.starts_with("- [ ]") || t.starts_with("- [x]") || t.starts_with("- [X]") {
                 let done = t.starts_with("- [x]") || t.starts_with("- [X]");
                 let text = t[5..].trim().to_string();
@@ -182,32 +331,27 @@ fn parse_note_lines(content: &str) -> Vec<NoteItem> {
                 return NoteItem { line_idx, kind: "task".to_string(), text, done, task_id: id, level: 0, indent };
             }
 
-            // Heading
             if t.starts_with('#') {
                 let level = t.chars().take_while(|c| *c == '#').count() as u8;
                 let text = t[level as usize..].trim().to_string();
                 return NoteItem { line_idx, kind: "heading".to_string(), text, done: false, task_id: 0, level, indent: 0 };
             }
 
-            // Horizontal rule
             let stripped = t.replace('-', "").replace('*', "").replace('_', "").replace(' ', "");
             if stripped.is_empty() && (t.contains("---") || t.contains("***") || t.contains("___")) {
                 return NoteItem { line_idx, kind: "separator".to_string(), text: String::new(), done: false, task_id: 0, level: 0, indent: 0 };
             }
 
-            // Bullet point (non-task list item: "- text" or "* text")
             if t.starts_with("- ") || t.starts_with("* ") {
                 let text = t[2..].trim().to_string();
                 return NoteItem { line_idx, kind: "bullet".to_string(), text, done: false, task_id: 0, level: 0, indent };
             }
 
-            // Plain text / empty
             NoteItem { line_idx, kind: "text".to_string(), text: t.to_string(), done: false, task_id: 0, level: 0, indent: 0 }
         })
         .collect()
 }
 
-/// Returns the 0-indexed line number of the FIRST task in the file, or None.
 fn first_task_line(content: &str) -> Option<usize> {
     content.lines().enumerate().find_map(|(i, line)| {
         let t = line.trim_start();
@@ -241,8 +385,6 @@ fn reconstruct_file(original: &str, tasks: &[Task]) -> String {
 #[cfg(target_os = "windows")]
 fn apply_window_effects(window: &tauri::WebviewWindow) {
     use window_vibrancy::apply_acrylic;
-    // Apply acrylic blur — makes the window truly see-through on Windows.
-    // The RGBA tint (0,0,0,0) means fully transparent tint.
     apply_acrylic(window, Some((0, 0, 0, 0))).ok();
 }
 
@@ -255,8 +397,37 @@ fn apply_window_effects(window: &tauri::WebviewWindow) {
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn apply_window_effects(_window: &tauri::WebviewWindow) {}
 
-// ── File watcher ───────────────────────────────────────────────────────────────
+#[cfg(target_os = "windows")]
+fn clear_window_effects(window: &tauri::WebviewWindow) {
+    use window_vibrancy::clear_acrylic;
+    clear_acrylic(window).ok();
+}
 
+#[cfg(target_os = "macos")]
+fn clear_window_effects(window: &tauri::WebviewWindow) {
+    use window_vibrancy::clear_vibrancy;
+    clear_vibrancy(window).ok();
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn clear_window_effects(_window: &tauri::WebviewWindow) {}
+
+/// Toggle the platform blur effect (acrylic on Windows, vibrancy on macOS).
+/// When the reminder is firing we turn it OFF so the rings emit through real transparent
+/// air rather than through the window's frosted backdrop.
+#[tauri::command]
+fn set_window_blur(app: AppHandle, enabled: bool) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") {
+        if enabled {
+            apply_window_effects(&window);
+        } else {
+            clear_window_effects(&window);
+        }
+    }
+    Ok(())
+}
+
+// ── File watcher ───────────────────────────────────────────────────────────────
 
 fn start_watcher(
     app: &AppHandle,
@@ -264,7 +435,7 @@ fn start_watcher(
     ignore: Arc<Mutex<bool>>,
     watcher_guard: &mut Option<RecommendedWatcher>,
 ) {
-    *watcher_guard = None; // drop old watcher
+    *watcher_guard = None;
 
     let app_clone = app.clone();
     let ignore_clone = Arc::clone(&ignore);
@@ -327,10 +498,7 @@ fn read_tasks(state: State<'_, AppState>) -> Result<Vec<Task>, String> {
         let s = state.settings.lock().unwrap();
         target_file_path(&s).ok_or_else(|| "vault not configured".to_string())?
     };
-    // Guard against reading unexpectedly large files (> 1 MB).
-    let size = std::fs::metadata(&path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     if size > 1_000_000 {
         return Err(format!("file too large ({} KB); max 1 MB", size / 1024));
     }
@@ -352,7 +520,6 @@ fn write_tasks(state: State<'_, AppState>, tasks: Vec<Task>) -> Result<(), Strin
 
 #[tauri::command]
 fn add_task(state: State<'_, AppState>, text: String) -> Result<(), String> {
-    // Strip newlines to prevent markdown injection.
     let text = text.replace(['\n', '\r'], " ").trim().to_string();
     if text.is_empty() {
         return Ok(());
@@ -364,14 +531,12 @@ fn add_task(state: State<'_, AppState>, text: String) -> Result<(), String> {
     let content = std::fs::read_to_string(&path).unwrap_or_default();
     let new_line = format!("- [ ] {}\n", text);
     let new_content = if let Some(first_idx) = first_task_line(&content) {
-        // Insert the new task BEFORE the first existing task line.
         let mut lines: Vec<&str> = content.lines().collect();
         lines.insert(first_idx, new_line.trim_end_matches('\n'));
         let mut result = lines.join("\n");
         if content.ends_with('\n') { result.push('\n'); }
         result
     } else {
-        // No tasks yet — append at end.
         let mut c = content.clone();
         if !c.ends_with('\n') && !c.is_empty() { c.push('\n'); }
         c.push_str(&new_line);
@@ -411,9 +576,7 @@ fn set_opacity(app: AppHandle, state: State<'_, AppState>, opacity: f64) -> Resu
 fn update_shortcut(app: AppHandle, state: State<'_, AppState>, shortcut: String) -> Result<(), String> {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
     let old_shortcut = state.settings.lock().unwrap().shortcut.clone();
-    // Unregister old
     app.global_shortcut().unregister(old_shortcut.as_str()).ok();
-    // Register new
     app.global_shortcut().register(shortcut.as_str())
         .map_err(|e| format!("Invalid shortcut '{shortcut}': {e}"))?;
     {
@@ -480,11 +643,96 @@ fn pick_task_file(app: AppHandle) {
         });
 }
 
+/// Open a file picker for an audio file. On selection, stores the path in settings
+/// and switches the active tone to "custom". Result is delivered via `settings-changed`.
+#[tauri::command]
+fn pick_reminder_sound(app: AppHandle) {
+    use tauri_plugin_dialog::DialogExt;
+    let app_cb = app.clone();
+    app.dialog()
+        .file()
+        .add_filter("Audio", &["mp3", "wav", "ogg", "m4a", "flac", "aac", "MP3", "WAV", "OGG", "M4A", "FLAC", "AAC"])
+        .pick_file(move |file_path| {
+            let Some(fp) = file_path else { return };
+            let path_str = fp.to_string();
+            let state = app_cb.state::<AppState>();
+            {
+                let mut s = state.settings.lock().unwrap();
+                s.reminder_tone_path = path_str.clone();
+                s.reminder_tone = "custom".to_string();
+            }
+            let settings = state.settings.lock().unwrap().clone();
+            persist_settings(&app_cb, &settings);
+            app_cb.emit("settings-changed", settings).ok();
+        });
+}
+
+/// Read the raw bytes of the configured custom reminder sound file.
+/// Frontend wraps these in a Blob URL for HTMLAudioElement playback.
+#[tauri::command]
+fn read_reminder_sound(state: State<'_, AppState>) -> Result<Vec<u8>, String> {
+    let path = {
+        let s = state.settings.lock().unwrap();
+        s.reminder_tone_path.clone()
+    };
+    if path.is_empty() {
+        return Err("no custom sound configured".to_string());
+    }
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    // 5 MB cap. The bytes are serialised as a JSON number array over IPC, which
+    // is bandwidth-heavy; 5 MB is plenty for any alarm tone and keeps the
+    // first-play latency reasonable.
+    if size > 5_000_000 {
+        return Err(format!("file too large ({} KB); max 5 MB", size / 1024));
+    }
+    std::fs::read(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_reminder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    task_text: String,
+    remind_at: String,
+) -> Result<String, String> {
+    // Validate the time string parses to a real datetime — otherwise the
+    // reminder would sit in storage forever and never fire (silent failure).
+    if parse_remind_at(&remind_at).is_none() {
+        return Err(format!("invalid remind_at format: '{}'", remind_at));
+    }
+    let id = generate_id();
+    let reminder = Reminder { id: id.clone(), task_text, remind_at, fired: false };
+    let mut reminders = state.reminders.lock().unwrap();
+    reminders.push(reminder);
+    prune_fired_reminders(&mut reminders);
+    save_reminders(&app, &reminders);
+    Ok(id)
+}
+
+#[tauri::command]
+fn get_reminders(state: State<'_, AppState>) -> Vec<Reminder> {
+    state.reminders.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn delete_reminder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let mut reminders = state.reminders.lock().unwrap();
+    reminders.retain(|r| r.id != id);
+    prune_fired_reminders(&mut reminders);
+    save_reminders(&app, &reminders);
+    Ok(())
+}
+
 // ── Entry point ────────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -500,8 +748,6 @@ pub fn run() {
                     let state = app.state::<AppState>();
                     if let Some(window) = app.get_webview_window("main") {
                         let saved_aot = state.settings.lock().unwrap().always_on_top;
-                        // If not already always-on-top, set a temporary override so
-                        // the widget pops above everything just this once.
                         if !saved_aot {
                             *state.hotkey_aot_override.lock().unwrap() = true;
                             window.set_always_on_top(true).ok();
@@ -515,7 +761,6 @@ pub fn run() {
         .setup(|app| {
             let settings = load_settings(app.handle());
 
-            // Apply window config from saved settings
             if let Some(window) = app.get_webview_window("main") {
                 window.set_always_on_top(settings.always_on_top).ok();
                 let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
@@ -529,19 +774,21 @@ pub fn run() {
                 apply_window_effects(&window);
             }
 
-            // Build app state — clone shortcut before `settings` is moved in
             let initial_shortcut = settings.shortcut.clone();
             let ignore_change = Arc::new(Mutex::new(false));
             let hotkey_aot_override = Arc::new(Mutex::new(false));
+
+            let reminders = load_reminders(app.handle());
+
             let state = AppState {
                 watcher: Mutex::new(None),
                 ignore_change: Arc::clone(&ignore_change),
                 hotkey_aot_override: Arc::clone(&hotkey_aot_override),
                 settings: Mutex::new(settings),
+                reminders: Mutex::new(reminders),
             };
             app.manage(state);
 
-            // Start file watcher if vault is configured
             {
                 let state = app.state::<AppState>();
                 let file_path = {
@@ -554,15 +801,14 @@ pub fn run() {
                 }
             }
 
-            // Register global hotkey from saved settings
-            // Use the `settings` local (loaded above) to avoid borrow-after-move issues.
             use tauri_plugin_global_shortcut::GlobalShortcutExt;
-            let saved_shortcut = initial_shortcut;
-            if let Err(e) = app.global_shortcut().register(saved_shortcut.as_str()) {
-                eprintln!("Could not register global shortcut '{saved_shortcut}': {e}");
+            if let Err(e) = app.global_shortcut().register(initial_shortcut.as_str()) {
+                eprintln!("Could not register global shortcut '{initial_shortcut}': {e}");
             }
 
-            // Build tray menu
+            // Start background reminder scheduler
+            start_reminder_scheduler(app.handle().clone());
+
             let (aot, click_thru) = {
                 let state = app.state::<AppState>();
                 let s = state.settings.lock().unwrap();
@@ -706,7 +952,6 @@ pub fn run() {
                     window.hide().ok();
                     api.prevent_close();
                 }
-                // When the window loses focus, undo any hotkey-triggered AOT override.
                 tauri::WindowEvent::Focused(false) => {
                     let app = window.app_handle();
                     let state = app.state::<AppState>();
@@ -731,6 +976,12 @@ pub fn run() {
             read_note,
             set_opacity,
             update_shortcut,
+            add_reminder,
+            get_reminders,
+            delete_reminder,
+            set_window_blur,
+            pick_reminder_sound,
+            read_reminder_sound,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

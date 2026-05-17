@@ -4,6 +4,7 @@
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
   import NoteView from '$lib/NoteView.svelte';
+  import ReminderPicker from '$lib/ReminderPicker.svelte';
   import type { Task, NoteItem, Settings } from '$lib/types';
 
   const appWindow = getCurrentWebviewWindow();
@@ -13,6 +14,324 @@
   let newTaskText = $state('');
   let loading     = $state(true);
   let error       = $state<string | null>(null);
+
+  // ── Reminder state ──────────────────────────────────────────────────────────
+  let showReminderPicker  = $state(false);
+  let pendingReminderDate = $state<Date | null>(null);
+  let isReminderFiring    = $state(false);
+  let firingTaskText      = $state<string | null>(null);
+
+  /** "2026-05-17 11:15" — sent to the backend & embedded in the note tag */
+  function formatReminderDate(d: Date): string {
+    const p = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+
+  /** "(@2026-05-17 11:15)" — the form that lives inside the markdown task */
+  function formatReminderTag(d: Date): string {
+    return `(@${formatReminderDate(d)})`;
+  }
+
+  function formatReminderLabel(d: Date): string {
+    const days   = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const h = d.getHours(), m = d.getMinutes();
+    const ampm = h < 12 ? 'AM' : 'PM';
+    const h12  = h === 0 ? 12 : h > 12 ? h - 12 : h;
+    return `${days[d.getDay()]} ${months[d.getMonth()]} ${d.getDate()}, ${h12}:${String(m).padStart(2,'0')} ${ampm}`;
+  }
+
+  // ── Reminder tones via Web Audio (no asset files needed) ───────────────────
+  let audioCtx: AudioContext | null = null;
+
+  function getAudio(): AudioContext | null {
+    if (!audioCtx) {
+      try {
+        const Ctor = (window as any).AudioContext ?? (window as any).webkitAudioContext;
+        if (!Ctor) return null;
+        audioCtx = new Ctor();
+      } catch {
+        return null;
+      }
+    }
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+    return audioCtx;
+  }
+
+  type ToneId = 'chime' | 'bell' | 'beep' | 'digital' | 'soft' | 'custom';
+  interface ToneNote { freq: number; start: number; duration: number; peak?: number; type?: OscillatorType; }
+  interface Tone { label: string; notes: ToneNote[]; cycle: number; }
+
+  // `cycle` is how long one full loop iteration takes (sound + gap), in seconds.
+  // Only built-in tones live here; 'custom' is handled via HTMLAudioElement.
+  const TONES: Record<Exclude<ToneId, 'custom'>, Tone> = {
+    chime: {
+      label: 'Chime',
+      notes: [
+        { freq: 523.25, start: 0.00, duration: 0.55 },
+        { freq: 659.25, start: 0.14, duration: 0.55 },
+        { freq: 783.99, start: 0.28, duration: 0.80 },
+        { freq: 1046.5, start: 0.45, duration: 1.00, peak: 0.12 },
+      ],
+      cycle: 2.2,
+    },
+    bell: {
+      label: 'Bell',
+      notes: [
+        { freq: 880,  start: 0,    duration: 1.4, peak: 0.2 },
+        { freq: 1760, start: 0,    duration: 0.7, peak: 0.08 },
+        { freq: 2640, start: 0,    duration: 0.4, peak: 0.04 },
+      ],
+      cycle: 1.8,
+    },
+    beep: {
+      label: 'Beep',
+      notes: [
+        { freq: 880, start: 0.00, duration: 0.14, peak: 0.18, type: 'square' },
+        { freq: 880, start: 0.25, duration: 0.14, peak: 0.18, type: 'square' },
+        { freq: 880, start: 0.50, duration: 0.14, peak: 0.18, type: 'square' },
+      ],
+      cycle: 1.2,
+    },
+    digital: {
+      label: 'Digital',
+      notes: [
+        { freq: 1200, start: 0.00, duration: 0.20, peak: 0.15, type: 'triangle' },
+        { freq: 900,  start: 0.22, duration: 0.20, peak: 0.15, type: 'triangle' },
+        { freq: 1200, start: 0.44, duration: 0.20, peak: 0.15, type: 'triangle' },
+        { freq: 900,  start: 0.66, duration: 0.20, peak: 0.15, type: 'triangle' },
+      ],
+      cycle: 1.6,
+    },
+    soft: {
+      label: 'Soft',
+      notes: [
+        { freq: 440, start: 0.0, duration: 0.9, peak: 0.13 },
+        { freq: 554, start: 0.4, duration: 0.9, peak: 0.11 },
+      ],
+      cycle: 2.0,
+    },
+  };
+
+  function playTone(toneId: Exclude<ToneId, 'custom'>) {
+    const ctx  = getAudio();
+    if (!ctx) return;
+    const tone = TONES[toneId] ?? TONES.chime;
+    for (const n of tone.notes) {
+      const osc  = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = n.type ?? 'sine';
+      osc.frequency.value = n.freq;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      const t0   = ctx.currentTime + n.start;
+      const peak = n.peak ?? 0.18;
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(peak, t0 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + n.duration);
+      osc.start(t0);
+      osc.stop(t0 + n.duration);
+    }
+  }
+
+  let soundLoopTimer: ReturnType<typeof setInterval> | null = null;
+
+  // ── Custom audio (user-selected file) ──────────────────────────────────────
+  let customAudio:       HTMLAudioElement | null = null;
+  let customAudioBlobUrl: string | null = null;
+  let cachedTonePath:    string = '';
+
+  async function getCustomAudio(): Promise<HTMLAudioElement | null> {
+    const path = settings?.reminder_tone_path ?? '';
+    if (!path) return null;
+    if (path === cachedTonePath && customAudio) return customAudio;
+
+    // Invalidate any previously cached audio
+    if (customAudio) { customAudio.pause(); customAudio = null; }
+    if (customAudioBlobUrl) { URL.revokeObjectURL(customAudioBlobUrl); customAudioBlobUrl = null; }
+
+    try {
+      const bytes = await invoke<number[]>('read_reminder_sound');
+      const blob  = new Blob([new Uint8Array(bytes)]);
+      customAudioBlobUrl = URL.createObjectURL(blob);
+      customAudio        = new Audio(customAudioBlobUrl);
+      cachedTonePath     = path;
+      return customAudio;
+    } catch (e) {
+      console.error('[ob-widget] failed to load custom sound:', e);
+      return null;
+    }
+  }
+
+  async function playCustomSound(loop: boolean) {
+    const audio = await getCustomAudio();
+    if (!audio) return;
+    audio.loop = loop;
+    audio.currentTime = 0;
+    audio.play().catch(err => console.error('[ob-widget] custom-sound play failed:', err));
+  }
+
+  function stopCustomSound() {
+    if (customAudio) {
+      customAudio.pause();
+      customAudio.currentTime = 0;
+    }
+  }
+
+  function startSoundLoop(toneId: ToneId) {
+    stopSoundLoop();
+    if (toneId === 'custom') {
+      playCustomSound(true);
+      return;
+    }
+    const tone = TONES[toneId as Exclude<ToneId, 'custom'>] ?? TONES.chime;
+    playTone(toneId as Exclude<ToneId, 'custom'>);
+    soundLoopTimer = setInterval(() => playTone(toneId as Exclude<ToneId, 'custom'>), tone.cycle * 1000);
+  }
+
+  function stopSoundLoop() {
+    if (soundLoopTimer) {
+      clearInterval(soundLoopTimer);
+      soundLoopTimer = null;
+    }
+    stopCustomSound();
+  }
+
+  let reminderTimer: ReturnType<typeof setTimeout> | null = null;
+
+  async function handleReminderFired(taskText: string) {
+    // Disable the window's acrylic/vibrancy blur so the pulse rings travel through
+    // genuinely transparent air rather than through the frosted backdrop.
+    invoke('set_window_blur', { enabled: false }).catch(() => {});
+
+    // Bring widget to top (frontend mirror of the Rust side, in case of timing)
+    try {
+      await appWindow.show();
+      await appWindow.unminimize?.();
+      await appWindow.setAlwaysOnTop(true);
+      await appWindow.setFocus();
+    } catch {}
+
+    // Visual + audio feedback
+    isReminderFiring = true;
+    firingTaskText   = taskText;
+    const toneId = (settings?.reminder_tone as ToneId) ?? 'chime';
+    startSoundLoop(toneId);
+
+    // Auto-dismiss after 5 minutes if user never interacts
+    if (reminderTimer) clearTimeout(reminderTimer);
+    reminderTimer = setTimeout(() => dismissReminder(), 5 * 60 * 1000);
+  }
+
+  function dismissReminder() {
+    isReminderFiring = false;
+    firingTaskText   = null;
+    if (reminderTimer) { clearTimeout(reminderTimer); reminderTimer = null; }
+    stopSoundLoop();
+    // Restore the platform blur effect
+    invoke('set_window_blur', { enabled: true }).catch(() => {});
+    // Restore the user's preferred always-on-top setting
+    if (settings && !settings.always_on_top) {
+      appWindow.setAlwaysOnTop(false).catch(() => {});
+    }
+  }
+
+  // Strip any "(@YYYY-MM-DD HH:MM)" / legacy "@YYYY-MM-DDTHH:MM" tag from a task line
+  const REMINDER_TAG_RE = /\s*\(@\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}\)\s*|\s*@\d{4}-\d{2}-\d{2}T\d{2}:\d{2}\s*/g;
+  function stripReminderTag(s: string): string {
+    return s.replace(REMINDER_TAG_RE, ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  async function snoozeReminder() {
+    const text = firingTaskText;
+    if (!text) { dismissReminder(); return; }
+
+    const snoozeAt  = new Date(Date.now() + 10 * 60 * 1000);
+    const snoozeIso = formatReminderDate(snoozeAt);
+    const newTag    = `(@${snoozeIso})`;
+
+    // Rewrite the matching task in the markdown file so the (@time) reflects the snooze
+    let modified = false;
+    const updatedItems = noteItems.map(item => {
+      if (item.kind !== 'task') return item;
+      if (stripReminderTag(item.text) !== text) return item;
+      modified = true;
+      return { ...item, text: `${text} ${newTag}` };
+    });
+
+    if (modified) {
+      noteItems = updatedItems;
+      try {
+        await invoke('write_tasks', { tasks: buildTasksFromItems(updatedItems) });
+      } catch (e) {
+        console.error('snooze write_tasks failed', e);
+      }
+    }
+
+    // Schedule a fresh reminder 10 minutes out
+    try {
+      await invoke('add_reminder', { taskText: text, remindAt: snoozeIso });
+    } catch (e) {
+      console.error('snooze add_reminder failed', e);
+    }
+
+    dismissReminder();
+  }
+
+  function handleTaskInput(e: Event) {
+    const ie = e as InputEvent;
+    if (ie.data === '@') {
+      showReminderPicker = true;
+    }
+  }
+
+  function onReminderConfirm(date: Date) {
+    pendingReminderDate = date;
+    showReminderPicker  = false;
+    // Remove the trailing @ from the input
+    const idx = newTaskText.lastIndexOf('@');
+    if (idx !== -1) newTaskText = newTaskText.slice(0, idx) + newTaskText.slice(idx + 1);
+  }
+
+  function onReminderCancel() {
+    showReminderPicker  = false;
+    pendingReminderDate = null;
+    const idx = newTaskText.lastIndexOf('@');
+    if (idx !== -1) newTaskText = newTaskText.slice(0, idx) + newTaskText.slice(idx + 1);
+  }
+
+  // ── Sound (tone) popover ───────────────────────────────────────────────────
+  let showSoundPopover = $state(false);
+  const BUILT_IN_TONE_IDS: Exclude<ToneId, 'custom'>[] = ['chime', 'bell', 'beep', 'digital', 'soft'];
+
+  function toggleSoundPopover() { showSoundPopover = !showSoundPopover; }
+
+  async function selectTone(id: ToneId) {
+    if (!settings) return;
+    const updated = { ...settings, reminder_tone: id };
+    settings = updated;
+    await invoke('save_settings', { settings: updated });
+  }
+
+  async function previewTone(id: ToneId) {
+    // Stop any in-progress preview/loop so the new tone is heard cleanly
+    stopSoundLoop();
+    if (id === 'custom') {
+      await playCustomSound(false);
+      return;
+    }
+    playTone(id);
+  }
+
+  async function pickCustomSound() {
+    // Result comes back via the `settings-changed` event (the picker is callback-based).
+    await invoke('pick_reminder_sound');
+  }
+
+  function fileBaseName(p: string): string {
+    const m = p.match(/[\\\/]([^\\\/]+)$/);
+    return m ? m[1] : p;
+  }
 
   // ── Transparency popover ────────────────────────────────────────────────────
   let showOpacitySlider = $state(false);
@@ -29,14 +348,16 @@
     showOpacitySlider = !showOpacitySlider;
   }
 
-  // Close popover when clicking outside
+  // Close popovers when clicking outside
   function handleGlobalClick(e: MouseEvent) {
     const target = e.target as HTMLElement;
     if (showOpacitySlider && !target.closest('.opacity-wrap')) showOpacitySlider = false;
+    if (showSoundPopover  && !target.closest('.sound-wrap'))   showSoundPopover  = false;
     if (showShortcutPopover && !target.closest('.shortcut-wrap')) {
       showShortcutPopover = false;
       recordingShortcut = false;
     }
+    if (showReminderPicker && !target.closest('.reminder-overlay')) onReminderCancel();
   }
 
   // ── Theme ──────────────────────────────────────────────────────────────────
@@ -112,8 +433,9 @@
   }
 
   onMount(() => {
-    let unlistenFile: (() => void) | undefined;
+    let unlistenFile:     (() => void) | undefined;
     let unlistenSettings: (() => void) | undefined;
+    let unlistenReminder: (() => void) | undefined;
 
     (async () => {
       await loadSettings();
@@ -123,13 +445,38 @@
 
       unlistenFile = await listen('file-changed', () => loadNote());
       unlistenSettings = await listen<Settings>('settings-changed', (e) => {
+        const oldTonePath = settings?.reminder_tone_path ?? '';
         settings = e.payload;
         applyTheme((settings?.theme ?? 'system') as Theme);
         if (settings?.vault_path) loadNote();
+        // If the user picked a new custom sound, drop the cached audio so the next
+        // play (preview or fire) re-reads the file.
+        if ((settings?.reminder_tone_path ?? '') !== oldTonePath) {
+          stopCustomSound();
+          if (customAudio) customAudio = null;
+          if (customAudioBlobUrl) { URL.revokeObjectURL(customAudioBlobUrl); customAudioBlobUrl = null; }
+          cachedTonePath = '';
+        }
+      });
+      unlistenReminder = await listen<string>('reminder-fired', (e) => {
+        console.log('[ob-widget] reminder-fired event received:', e.payload);
+        handleReminderFired(e.payload);
       });
     })();
 
-    return () => { unlistenFile?.(); unlistenSettings?.(); };
+    return () => {
+      // Release all listeners, timers, and audio resources. The root component
+      // doesn't usually unmount during normal use, but this keeps things tidy
+      // for HMR during dev and avoids dangling resources if it ever does.
+      unlistenFile?.();
+      unlistenSettings?.();
+      unlistenReminder?.();
+      stopSoundLoop();
+      if (reminderTimer) { clearTimeout(reminderTimer); reminderTimer = null; }
+      if (customAudioBlobUrl) { URL.revokeObjectURL(customAudioBlobUrl); customAudioBlobUrl = null; }
+      customAudio = null;
+      if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
+    };
   });
 
   // ── Task operations ────────────────────────────────────────────────────────
@@ -164,10 +511,22 @@
   }
 
   async function handleAddTask() {
-    const text = newTaskText.trim();
+    const raw  = newTaskText.trim();
+    const text = raw.replace(/@\s*$/, '').trim(); // strip lone trailing @ if picker dismissed
     if (!text) return;
+    // Embed the (@YYYY-MM-DD HH:MM) tag in the note so it's visible in Obsidian
+    const noteText = pendingReminderDate
+      ? `${text} ${formatReminderTag(pendingReminderDate)}`
+      : text;
     newTaskText = '';
-    await invoke('add_task', { text });
+    await invoke('add_task', { text: noteText });
+    if (pendingReminderDate) {
+      await invoke('add_reminder', {
+        taskText: text,                                // clean text for notification body
+        remindAt: formatReminderDate(pendingReminderDate),
+      });
+      pendingReminderDate = null;
+    }
     await loadNote();
   }
 
@@ -223,7 +582,13 @@
   }
 </script>
 
-<svelte:window onclick={handleGlobalClick} onkeydown={handleShortcutKeydown} />
+<svelte:window
+  onclick={handleGlobalClick}
+  onkeydown={(e) => {
+    if (e.key === 'Escape' && showReminderPicker) { onReminderCancel(); return; }
+    handleShortcutKeydown(e);
+  }}
+/>
 
 <!-- Invisible resize handles on all 8 edges/corners -->
 <div class="rh rh-n"  onmousedown={(e) => onResizeMousedown(e, 'North')}     role="none"></div>
@@ -235,7 +600,16 @@
 <div class="rh rh-se" onmousedown={(e) => onResizeMousedown(e, 'SouthEast')} role="none"></div>
 <div class="rh rh-sw" onmousedown={(e) => onResizeMousedown(e, 'SouthWest')} role="none"></div>
 
-<div class="widget">
+<!-- Outward pulse rings — siblings of .widget so they aren't clipped by widget overflow:hidden -->
+{#if isReminderFiring}
+  <div class="pulse-rings" aria-hidden="true">
+    <span class="ring"></span>
+    <span class="ring" style="animation-delay: 0.55s"></span>
+    <span class="ring" style="animation-delay: 1.1s"></span>
+  </div>
+{/if}
+
+<div class="widget" class:firing={isReminderFiring}>
   <!-- Header — data-tauri-drag-region makes the whole row draggable;
        buttons inside are automatically excluded from drag detection -->
   <div class="header" data-tauri-drag-region role="none">
@@ -280,6 +654,78 @@
               value={opacity}
               oninput={(e) => handleOpacityChange(parseFloat((e.target as HTMLInputElement).value))}
             />
+          </div>
+        {/if}
+      </div>
+
+      <!-- Reminder sound (bell) -->
+      <div class="sound-wrap" data-tauri-drag-region>
+        <button
+          class="icon-btn"
+          onclick={(e) => { e.stopPropagation(); toggleSoundPopover(); }}
+          title="Reminder sound"
+          aria-label="Reminder sound"
+          data-tauri-drag-region="false"
+        >
+          <!-- Bell icon -->
+          <svg viewBox="0 0 16 16" fill="currentColor">
+            <path d="M8 1.5a.75.75 0 0 1 .75.75v.32A4.001 4.001 0 0 1 12 6.5v2.382l.894 1.789A.75.75 0 0 1 12.224 11.75H3.776a.75.75 0 0 1-.67-1.079L4 8.882V6.5a4.001 4.001 0 0 1 3.25-3.93V2.25A.75.75 0 0 1 8 1.5Zm-1.5 11.25h3a1.5 1.5 0 0 1-3 0Z"/>
+          </svg>
+        </button>
+
+        {#if showSoundPopover}
+          <div class="sound-popover" role="none" onclick={(e) => e.stopPropagation()}>
+            <p class="sound-title">Reminder sound</p>
+            {#each BUILT_IN_TONE_IDS as id}
+              <div class="sound-row">
+                <button
+                  class="sound-pick"
+                  class:active={settings?.reminder_tone === id}
+                  onclick={() => selectTone(id)}
+                >
+                  <span class="sound-radio">{settings?.reminder_tone === id ? '●' : '○'}</span>
+                  <span class="sound-label">{TONES[id].label}</span>
+                </button>
+                <button
+                  class="sound-preview"
+                  onclick={(e) => { e.stopPropagation(); previewTone(id); }}
+                  title="Preview {TONES[id].label}"
+                  aria-label="Preview {TONES[id].label}"
+                >&#9654;</button>
+              </div>
+            {/each}
+
+            <!-- Custom tone -->
+            <div class="sound-row">
+              <button
+                class="sound-pick"
+                class:active={settings?.reminder_tone === 'custom'}
+                onclick={() => selectTone('custom')}
+                disabled={!settings?.reminder_tone_path}
+                title={!settings?.reminder_tone_path ? 'Choose a file first' : ''}
+              >
+                <span class="sound-radio">{settings?.reminder_tone === 'custom' ? '●' : '○'}</span>
+                <span class="sound-label">Custom</span>
+              </button>
+              {#if settings?.reminder_tone_path}
+                <button
+                  class="sound-preview"
+                  onclick={(e) => { e.stopPropagation(); previewTone('custom'); }}
+                  title="Preview custom sound"
+                  aria-label="Preview custom sound"
+                >&#9654;</button>
+              {/if}
+            </div>
+
+            <!-- File picker row -->
+            <div class="sound-file-row">
+              <span class="sound-file-name" title={settings?.reminder_tone_path ?? ''}>
+                {settings?.reminder_tone_path ? fileBaseName(settings.reminder_tone_path) : 'No file selected'}
+              </span>
+              <button class="sound-browse" onclick={pickCustomSound}>
+                {settings?.reminder_tone_path ? 'Change…' : 'Browse…'}
+              </button>
+            </div>
           </div>
         {/if}
       </div>
@@ -404,13 +850,44 @@
       <input
         class="add-input"
         type="text"
-        placeholder="New task…"
+        placeholder="New task… (@ for reminder)"
         bind:value={newTaskText}
-        onkeydown={(e) => e.key === 'Enter' && handleAddTask()}
+        oninput={handleTaskInput}
+        onkeydown={(e) => { if (e.key === 'Enter' && !showReminderPicker) handleAddTask(); }}
       />
+      {#if pendingReminderDate}
+        <div class="reminder-badge">
+          <span class="reminder-badge-icon">&#9200;</span>
+          <span class="reminder-badge-label">{formatReminderLabel(pendingReminderDate)}</span>
+          <button
+            class="reminder-badge-clear"
+            onclick={() => { pendingReminderDate = null; }}
+            aria-label="Clear reminder"
+          >&#215;</button>
+        </div>
+      {/if}
+    </div>
+  {/if}
+
+  {#if showReminderPicker}
+    <div class="reminder-overlay">
+      <ReminderPicker onconfirm={onReminderConfirm} oncancel={onReminderCancel} />
     </div>
   {/if}
 </div>
+
+<!-- Reminder alert — sibling of .widget so it stays full-size while the widget is scaled -->
+{#if isReminderFiring && firingTaskText}
+  <div class="reminder-alert" role="alert">
+    <div class="alert-icon">&#9200;</div>
+    <div class="alert-title">Reminder</div>
+    <div class="alert-text">{firingTaskText}</div>
+    <div class="alert-actions">
+      <button class="alert-btn alert-snooze" onclick={snoozeReminder}>Snooze 10 min</button>
+      <button class="alert-btn alert-ok"     onclick={dismissReminder}>Okay</button>
+    </div>
+  </div>
+{/if}
 
 <style>
   /* ── Theme via color-scheme ──────────────────────────────────────────────── */
@@ -442,7 +919,132 @@
     );
     border-radius: 10px;
     overflow: hidden;
+    position: relative;
+    isolation: isolate;
+    transform-origin: center center;
+    transition: transform 0.3s ease, box-shadow 0.3s;
+    z-index: 1;
   }
+
+  /* When firing, shrink the widget so the rings have transparent room to expand into */
+  .widget.firing {
+    transform: scale(0.9);
+    /* No outward box-shadow — keep the area outside the widget completely transparent */
+  }
+
+  /* Inner blue glow at the widget's inside edge (clipped inside widget by overflow:hidden) */
+  .widget.firing::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    box-shadow: inset 0 0 22px rgba(10, 132, 255, 0.35);
+    animation: inner-glow 1.4s ease-in-out infinite;
+  }
+
+  @keyframes inner-glow {
+    0%, 100% { box-shadow: inset 0 0 16px rgba(10, 132, 255, 0.28); }
+    50%      { box-shadow: inset 0 0 30px rgba(10, 132, 255, 0.55); }
+  }
+
+  /* ── Outward pulse rings — thin wave lines in transparent air ────────────── */
+  .pulse-rings {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .ring {
+    position: absolute;
+    inset: 0;
+    border-radius: 10px;
+    background: transparent;
+    /* Thin wave line — no box-shadow, no filter:blur. The acrylic blur is also
+       disabled while firing (via set_window_blur), so the margin is fully transparent. */
+    border: 1.5px solid rgba(10, 132, 255, 0.85);
+    box-sizing: border-box;
+    transform: scale(0.9);
+    transform-origin: center center;
+    animation: ring-emit 1.7s cubic-bezier(0.22, 0.61, 0.36, 1) infinite;
+    will-change: transform, opacity, border-width;
+  }
+
+  @keyframes ring-emit {
+    0%   { transform: scale(0.9);  opacity: 0.95; border-width: 2px;   }
+    60%  {                          opacity: 0.5;  border-width: 1px;   }
+    100% { transform: scale(1.06); opacity: 0;    border-width: 0;    }
+  }
+
+  /* ── Reminder alert (Okay / Snooze) ─────────────────────────────────────── */
+  .reminder-alert {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 400;
+    width: calc(100% - 36px);
+    max-width: 240px;
+    background: light-dark(rgba(248, 250, 255, 0.98), rgba(24, 28, 38, 0.98));
+    border: 2px solid rgba(10, 132, 255, 0.65);
+    border-radius: 10px;
+    padding: 12px 14px 10px;
+    text-align: center;
+    box-shadow: 0 10px 36px rgba(10, 132, 255, 0.3), 0 4px 14px rgba(0, 0, 0, 0.3);
+    color: light-dark(#1a1a1a, #eaf1fb);
+  }
+
+  .alert-icon { font-size: 22px; line-height: 1; }
+
+  .alert-title {
+    font-size: 9.5px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    opacity: 0.55;
+    margin-top: 2px;
+  }
+
+  .alert-text {
+    font-size: 12.5px;
+    font-weight: 500;
+    margin: 5px 0 10px;
+    line-height: 1.3;
+    word-wrap: break-word;
+    max-height: 64px;
+    overflow: hidden;
+  }
+
+  .alert-actions {
+    display: flex;
+    gap: 5px;
+  }
+
+  .alert-btn {
+    flex: 1;
+    border-radius: 5px;
+    border: 1px solid rgba(128, 128, 128, 0.25);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 10.5px;
+    padding: 5px 6px;
+    transition: background 0.12s, opacity 0.12s;
+  }
+
+  .alert-snooze {
+    background: rgba(128, 128, 128, 0.12);
+    color: inherit;
+  }
+  .alert-snooze:hover { background: rgba(128, 128, 128, 0.22); }
+
+  .alert-ok {
+    background: light-dark(#007aff, #0a84ff);
+    color: #fff;
+    border-color: transparent;
+    font-weight: 600;
+  }
+  .alert-ok:hover { opacity: 0.88; }
 
   /* ── Header ──────────────────────────────────────────────────────────────── */
   .header {
@@ -572,6 +1174,122 @@
     background: light-dark(#222, #fff);
   }
 
+  /* ── Sound (tone) popover ────────────────────────────────────────────────── */
+  .sound-wrap { position: relative; }
+
+  .sound-popover {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    background: light-dark(rgba(255,255,255,0.97), rgba(38,38,42,0.97));
+    border: 1px solid rgba(128,128,128,0.2);
+    border-radius: 8px;
+    padding: 8px 8px 6px;
+    z-index: 1000;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.18);
+    min-width: 160px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .sound-title {
+    font-size: 10px;
+    font-weight: 600;
+    opacity: 0.55;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    margin: 0 0 4px;
+    padding: 0 4px;
+  }
+
+  .sound-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .sound-pick {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    color: inherit;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 11.5px;
+    padding: 4px 6px;
+    text-align: left;
+    transition: background 0.1s;
+  }
+  .sound-pick:hover { background: rgba(128,128,128,0.12); }
+  .sound-pick.active { background: rgba(10,132,255,0.12); color: light-dark(#005fcc, #4aabff); }
+
+  .sound-radio {
+    width: 12px;
+    font-size: 11px;
+    line-height: 1;
+    opacity: 0.7;
+  }
+
+  .sound-label { flex: 1; }
+
+  .sound-preview {
+    width: 22px;
+    height: 22px;
+    border-radius: 4px;
+    border: 1px solid rgba(128,128,128,0.2);
+    background: rgba(128,128,128,0.08);
+    color: inherit;
+    cursor: pointer;
+    font-size: 9px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.1s;
+  }
+  .sound-preview:hover { background: rgba(128,128,128,0.2); }
+
+  .sound-pick:disabled { opacity: 0.4; cursor: not-allowed; }
+  .sound-pick:disabled:hover { background: transparent; }
+
+  .sound-file-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 6px 2px;
+    margin-top: 4px;
+    border-top: 1px solid rgba(128,128,128,0.15);
+  }
+
+  .sound-file-name {
+    flex: 1;
+    font-size: 10px;
+    opacity: 0.55;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-style: italic;
+  }
+
+  .sound-browse {
+    background: rgba(128,128,128,0.12);
+    border: 1px solid rgba(128,128,128,0.22);
+    border-radius: 4px;
+    color: inherit;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 10px;
+    padding: 3px 8px;
+    transition: background 0.1s;
+    flex-shrink: 0;
+  }
+  .sound-browse:hover { background: rgba(128,128,128,0.22); }
+
   /* ── States ──────────────────────────────────────────────────────────────── */
   .state-msg {
     flex: 1;
@@ -618,6 +1336,45 @@
   }
 
   .setup-btn:hover { background: rgba(128, 128, 128, 0.22); }
+
+  /* ── Reminder overlay ───────────────────────────────────────────────────── */
+  .reminder-overlay {
+    position: absolute;
+    bottom: 48px;
+    left: 8px;
+    right: 8px;
+    z-index: 200;
+  }
+
+  /* ── Reminder badge ──────────────────────────────────────────────────────── */
+  .reminder-badge {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-top: 4px;
+    padding: 3px 6px;
+    background: rgba(0, 122, 255, 0.1);
+    border: 1px solid rgba(0, 122, 255, 0.3);
+    border-radius: 4px;
+    font-size: 10.5px;
+    color: light-dark(#0060cc, #3fa0ff);
+  }
+
+  .reminder-badge-icon { font-size: 11px; }
+
+  .reminder-badge-label { flex: 1; }
+
+  .reminder-badge-clear {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: inherit;
+    font-size: 13px;
+    line-height: 1;
+    padding: 0 1px;
+    opacity: 0.6;
+  }
+  .reminder-badge-clear:hover { opacity: 1; }
 
   /* ── Add-task row ────────────────────────────────────────────────────────── */
   .add-row {

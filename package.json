@@ -1,8 +1,20 @@
 {
   "name": "ob-widget",
   "version": "0.1.1",
-  "description": "",
+  "description": "Obsidian Live Widget — a persistent, interactive desktop widget for your Obsidian tasks.",
   "type": "module",
+  "author": {
+    "name": "Uves Arshad",
+    "url": "https://x.com/uvesarshad"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/uvesarshad/ob-widget"
+  },
+  "bugs": {
+    "url": "https://github.com/uvesarshad/ob-widget/issues"
+  },
+  "homepage": "https://github.com/uvesarshad/ob-widget#readme",
   "scripts": {
     "dev": "vite dev",
     "build": "vite build",

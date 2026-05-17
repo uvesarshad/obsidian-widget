@@ -1,9 +1,12 @@
 [package]
 name = "ob-widget"
 version = "0.1.0"
-description = "Obsidian Live Widget"
-authors = ["Uves"]
+description = "Obsidian Live Widget — a persistent, interactive desktop widget for your Obsidian tasks."
+authors = ["Uves Arshad <https://x.com/uvesarshad>"]
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/uvesarshad/ob-widget"
+homepage = "https://github.com/uvesarshad/ob-widget"
 
 [lib]
 name = "ob_widget_lib"
@@ -21,3 +24,5 @@ notify = "6"
 window-vibrancy = "0.6"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-autostart = "2"
+tauri-plugin-notification = "2"
+chrono = { version = "0.4", features = ["serde"] }

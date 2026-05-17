@@ -21,6 +21,15 @@ export interface Settings {
   theme: 'system' | 'light' | 'dark';
   opacity: number;
   shortcut: string;
+  reminder_tone: string;
+  reminder_tone_path: string;
+}
+
+export interface Reminder {
+  id: string;
+  task_text: string;
+  remind_at: string; // "YYYY-MM-DDTHH:MM"
+  fired: boolean;
 }
 
 export interface NoteItem {
